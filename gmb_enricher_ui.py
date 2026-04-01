@@ -50,6 +50,26 @@ st.markdown("""
     .stat-number { font-size: 2rem; font-weight: 700; color: #00d2ff; }
     .stat-label { color: #8892b0; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; }
     [data-testid="stSidebar"] { background: rgba(15,15,26,0.95); border-right: 1px solid rgba(255,255,255,0.05); }
+    /* Make sidebar toggle arrow bigger and visible */
+    [data-testid="collapsedControl"] {
+        background: #00d2ff !important;
+        border-radius: 0 12px 12px 0 !important;
+        width: 40px !important;
+        height: 50px !important;
+        top: 50% !important;
+        transform: translateY(-50%) !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        box-shadow: 0 0 15px rgba(0, 210, 255, 0.4) !important;
+        z-index: 999 !important;
+    }
+    [data-testid="collapsedControl"] svg {
+        width: 24px !important;
+        height: 24px !important;
+        color: #0f0f1a !important;
+        stroke: #0f0f1a !important;
+    }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
     .processing-text { font-family: 'JetBrains Mono', monospace; color: #ccd6f6; font-size: 0.9rem; }
 </style>
