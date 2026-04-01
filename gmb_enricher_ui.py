@@ -73,7 +73,7 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 }
-REQUEST_TIMEOUT = 6  # aggressive — skip slow/dead sites fast
+REQUEST_TIMEOUT = 12  # keep at 12 to avoid dropping slow UK sites
 
 # Priority pages first, secondary only if needed
 PRIORITY_PATHS = ["/about", "/about-us", "/"]
