@@ -70,7 +70,10 @@ st.markdown("""
         color: #0f0f1a !important;
         stroke: #0f0f1a !important;
     }
-    #MainMenu {visibility: hidden;} footer {visibility: hidden;} header {visibility: hidden;}
+    #MainMenu {visibility: hidden;} footer {visibility: hidden;}
+    /* Hide Streamlit branding but keep sidebar toggle visible */
+    [data-testid="stHeader"] { background: transparent !important; }
+    [data-testid="stToolbar"] { visibility: hidden; }
     .processing-text { font-family: 'JetBrains Mono', monospace; color: #ccd6f6; font-size: 0.9rem; }
 </style>
 """, unsafe_allow_html=True)
