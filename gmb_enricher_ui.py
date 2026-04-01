@@ -8,7 +8,7 @@ Speed features:
   - Companies House result caching (no duplicate lookups)
   - Connection pooling via requests.Session
   - Early stop on strong CH matches (skip remaining name variations)
-  - 6-second timeout (skip dead sites fast)
+  - 12-second timeout (skip dead sites fast)
   - Auto-skip non-business URLs (google.com/maps, etc.)
 
 Run with:  streamlit run gmb_enricher_ui.py
