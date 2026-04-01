@@ -32,7 +32,7 @@ except ImportError:
 # ──────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="GMB Lead Enricher", page_icon="🔍",
-                   layout="wide", initial_sidebar_state="expanded")
+                   layout="wide")
 
 st.markdown("""
 <style>
@@ -49,29 +49,7 @@ st.markdown("""
     }
     .stat-number { font-size: 2rem; font-weight: 700; color: #00d2ff; }
     .stat-label { color: #8892b0; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; }
-    [data-testid="stSidebar"] { background: rgba(15,15,26,0.95); border-right: 1px solid rgba(255,255,255,0.05); }
-    /* Make sidebar toggle arrow bigger and visible */
-    [data-testid="collapsedControl"] {
-        background: #00d2ff !important;
-        border-radius: 0 12px 12px 0 !important;
-        width: 40px !important;
-        height: 50px !important;
-        top: 50% !important;
-        transform: translateY(-50%) !important;
-        display: flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-        box-shadow: 0 0 15px rgba(0, 210, 255, 0.4) !important;
-        z-index: 999 !important;
-    }
-    [data-testid="collapsedControl"] svg {
-        width: 24px !important;
-        height: 24px !important;
-        color: #0f0f1a !important;
-        stroke: #0f0f1a !important;
-    }
     #MainMenu {visibility: hidden;} footer {visibility: hidden;}
-    /* Hide Streamlit branding but keep sidebar toggle visible */
     [data-testid="stHeader"] { background: transparent !important; }
     [data-testid="stToolbar"] { visibility: hidden; }
     .processing-text { font-family: 'JetBrains Mono', monospace; color: #ccd6f6; font-size: 0.9rem; }
@@ -1110,58 +1088,52 @@ def _process_one_row(args):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sidebar
-# ──────────────────────────────────────────────────────────────────────────────
-
-with st.sidebar:
-    st.markdown("## ⚙️ Configuration")
-    st.markdown("---")
-
-    st.markdown("### Enrichment Sources")
-    enable_website = st.toggle("🌐 Website Scraper", value=True)
-    enable_facebook = st.toggle("📘 Facebook Pages", value=True)
-    enable_whois = st.toggle("🔎 WHOIS Lookup", value=WHOIS_AVAILABLE,
-                              disabled=not WHOIS_AVAILABLE)
-
-    st.markdown("---")
-    st.markdown("### API Keys")
-
-    ch_key = st.text_input("🏛️ Companies House Key",
-                           value=os.environ.get("COMPANIES_HOUSE_KEY", ""),
-                           type="password")
-    enable_ch = st.toggle("Enable Companies House", value=bool(ch_key)) if ch_key else False
-
-    hunter_key = st.text_input("📧 Hunter.io Key",
-                               value=os.environ.get("HUNTER_API_KEY", ""),
-                               type="password")
-    enable_hunter = st.toggle("Enable Hunter.io", value=bool(hunter_key)) if hunter_key else False
-
-    st.markdown("---")
-    st.markdown("### Performance")
-    workers = st.slider("Parallel workers", 1, 15, 10,
-                         help="10 = safe & fast, 15 = aggressive")
-
-    st.markdown("---")
-    st.markdown("### Status")
-    sources = {
-        "Companies House": bool(ch_key and enable_ch),
-        "Website Scraper": enable_website,
-        "Facebook Pages": enable_facebook,
-        "Hunter.io": bool(hunter_key and enable_hunter),
-        "WHOIS": enable_whois and WHOIS_AVAILABLE,
-        "Business Name Analysis": True,
-    }
-    for name, active in sources.items():
-        st.markdown(f"{'🟢' if active else '🔴'} {name}")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Main Content
 # ──────────────────────────────────────────────────────────────────────────────
 
 st.markdown('<p class="main-header">🔍 GMB Lead Enricher</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Upload your GMB data → get owner names, emails & personal numbers</p>',
             unsafe_allow_html=True)
+
+# ── Settings (on main page, always visible) ──
+with st.expander("⚙️ Settings — click to configure sources, API keys & performance", expanded=False):
+    set_col1, set_col2, set_col3 = st.columns(3)
+
+    with set_col1:
+        st.markdown("**Enrichment Sources**")
+        enable_website = st.toggle("🌐 Website Scraper", value=True)
+        enable_facebook = st.toggle("📘 Facebook Pages", value=True)
+        enable_whois = st.toggle("🔎 WHOIS Lookup", value=WHOIS_AVAILABLE,
+                                  disabled=not WHOIS_AVAILABLE)
+
+    with set_col2:
+        st.markdown("**API Keys**")
+        ch_key = st.text_input("🏛️ Companies House Key",
+                               value=os.environ.get("COMPANIES_HOUSE_KEY", ""),
+                               type="password")
+        enable_ch = st.toggle("Enable Companies House", value=bool(ch_key)) if ch_key else False
+
+        hunter_key = st.text_input("📧 Hunter.io Key",
+                                   value=os.environ.get("HUNTER_API_KEY", ""),
+                                   type="password")
+        enable_hunter = st.toggle("Enable Hunter.io", value=bool(hunter_key)) if hunter_key else False
+
+    with set_col3:
+        st.markdown("**Performance**")
+        workers = st.slider("Parallel workers", 1, 15, 10,
+                             help="10 = safe & fast, 15 = aggressive")
+
+        st.markdown("**Active Sources**")
+        sources = {
+            "Companies House": bool(ch_key and enable_ch),
+            "Website Scraper": enable_website,
+            "Facebook Pages": enable_facebook,
+            "Hunter.io": bool(hunter_key and enable_hunter),
+            "WHOIS": enable_whois and WHOIS_AVAILABLE,
+            "Business Name Analysis": True,
+        }
+        for name, active in sources.items():
+            st.markdown(f"{'🟢' if active else '🔴'} {name}")
 
 uploaded_file = st.file_uploader("Upload your GMB CSV or Excel file",
                                  type=["csv", "xlsx", "xls"])
