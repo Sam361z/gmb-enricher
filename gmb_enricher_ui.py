@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """
-GMB Lead Enricher v3 — Streamlit UI (Speed Optimized)
-
-Speed features:
-  - Sources run IN PARALLEL within each row (not sequentially)
-  - Smart website scraping: 3 priority pages first, rest only if needed
-  - Companies House result caching (no duplicate lookups)
-  - Connection pooling via requests.Session
-  - Early stop on strong CH matches (skip remaining name variations)
-  - 6-second timeout (skip dead sites fast)
-  - Auto-skip non-business URLs (google.com/maps, etc.)
+GMB Lead Enricher v2 — Streamlit UI
+High hit-rate UK business owner finder with cross-referencing.
 
 Run with:  streamlit run gmb_enricher_ui.py
 """
@@ -39,7 +31,8 @@ except ImportError:
 # Page Config & Styling
 # ──────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="GMB Lead Enricher", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="GMB Lead Enricher", page_icon="🔍",
+                   layout="wide")
 
 st.markdown("""
 <style>
@@ -73,12 +66,11 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 }
-REQUEST_TIMEOUT = 12  # keep at 12 to avoid dropping slow UK sites
+REQUEST_TIMEOUT = 12
 
-# Priority pages first, secondary only if needed
-PRIORITY_PATHS = ["/about", "/about-us", "/"]
-SECONDARY_PATHS = ["/team", "/our-team", "/contact", "/contact-us",
-                   "/impressum", "/mentions-legales", "/about-me"]
+SCRAPE_PATHS = ["/about", "/about-us", "/team", "/our-team",
+                "/contact", "/contact-us", "/",
+                "/impressum", "/mentions-legales", "/about-me"]
 
 OWNER_TITLE_PATTERNS = [
     r"(?i)\b(founder|co-founder|owner|proprietor|director|managing\s+director"
@@ -95,17 +87,10 @@ FB_URL_RE = re.compile(
     r"(?:https?://)?(?:www\.|m\.)?facebook\.com/([a-zA-Z0-9._\-]+)/?", re.I
 )
 
-# URLs to skip — not real business websites
-SKIP_URL_PATTERNS = [
-    r"google\.com/maps", r"goo\.gl/maps", r"facebook\.com",
-    r"instagram\.com", r"twitter\.com", r"x\.com",
-    r"yelp\.com", r"tripadvisor\.", r"yell\.com",
-    r"192\.com", r"checkatrade\.com", r"trustatrader\.com",
-    r"linkedin\.com", r"tiktok\.com", r"youtube\.com",
-]
-
+# UK mobile prefixes
 UK_MOBILE_PREFIXES = ("07", "+447", "00447", "+44 7", "+44(0)7")
 
+# Common UK trade words to strip from company names when searching
 TRADE_WORDS = {
     "plumbing", "plumber", "plumbers", "electrical", "electrician", "electricians",
     "roofing", "roofer", "roofers", "carpentry", "carpenter", "carpenters",
@@ -130,6 +115,7 @@ TRADE_WORDS = {
     "driveways", "conservatories", "extensions", "lofts", "conversions",
 }
 
+# Location words to strip
 LOCATION_WORDS = {
     "london", "manchester", "birmingham", "leeds", "liverpool", "sheffield",
     "bristol", "newcastle", "nottingham", "leicester", "coventry", "bradford",
@@ -147,33 +133,6 @@ LOCATION_WORDS = {
     "northamptonshire", "leicestershire", "nottinghamshire",
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Connection Pool (reuse TCP connections across requests)
-# ──────────────────────────────────────────────────────────────────────────────
-
-_session_local = None
-
-def get_session() -> requests.Session:
-    """Thread-safe session with connection pooling."""
-    global _session_local
-    if _session_local is None:
-        _session_local = requests.Session()
-        _session_local.headers.update(HEADERS)
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=20, pool_maxsize=20, max_retries=1
-        )
-        _session_local.mount("http://", adapter)
-        _session_local.mount("https://", adapter)
-    return _session_local
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Companies House Cache
-# ──────────────────────────────────────────────────────────────────────────────
-
-if "ch_cache" not in st.session_state:
-    st.session_state.ch_cache = {}
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data Model
@@ -181,12 +140,13 @@ if "ch_cache" not in st.session_state:
 
 @dataclass
 class NameFinding:
+    """A single name finding from one source."""
     name: str
     title: str
-    source: str
-    method: str
-    confidence: float
-    company_number: str = ""
+    source: str           # e.g. "companies_house", "website", "facebook"
+    method: str           # human-readable explanation
+    confidence: float     # base confidence for this finding alone
+    company_number: str = ""  # for Companies House
 
 
 @dataclass
@@ -201,20 +161,19 @@ class EnrichmentResult:
     how_found: str = ""
     name_findings: List[NameFinding] = field(default_factory=list)
 
-    def merge_source(self, other: "EnrichmentResult"):
-        self.emails_found.extend(other.emails_found)
-        self.phones_found.extend(other.phones_found)
-        self.name_findings.extend(other.name_findings)
-        if other.owner_email and not self.owner_email:
-            self.owner_email = other.owner_email
-
     def finalize(self, business_phones: list = None):
+        """Deduplicate, cross-reference names, pick best results."""
         self.emails_found = list(dict.fromkeys(self.emails_found))
         self.phones_found = list(dict.fromkeys(self.phones_found))
+
         if not self.owner_email and self.emails_found:
             self.owner_email = self._best_email()
+
+        # Personal phone filtering
         if not self.personal_phone and self.phones_found:
             self.personal_phone = self._best_personal_phone(business_phones or [])
+
+        # Cross-reference name findings
         if self.name_findings:
             self._resolve_owner_name()
 
@@ -227,29 +186,52 @@ class EnrichmentResult:
             self.emails_found[0] if self.emails_found else None)
 
     def _best_personal_phone(self, business_phones: list) -> Optional[str]:
+        """Find a personal phone number, filtering out business numbers."""
+        # Normalize business phones for comparison
         biz_digits = set()
         for bp in business_phones:
             digits = re.sub(r"\D", "", str(bp))
             if len(digits) >= 7:
-                biz_digits.add(digits[-10:])
+                biz_digits.add(digits[-10:])  # last 10 digits for comparison
 
+        candidates = []
         for phone in self.phones_found:
             digits = re.sub(r"\D", "", phone)
+            # Skip if it matches a known business number
             if digits[-10:] in biz_digits:
                 continue
-            if any(phone.strip().startswith(p) for p in UK_MOBILE_PREFIXES):
-                return phone
-        return None
+            # Prioritize UK mobile numbers
+            is_mobile = any(phone.strip().startswith(p) for p in UK_MOBILE_PREFIXES)
+            candidates.append((phone, is_mobile))
+
+        # Return first mobile, or nothing
+        mobiles = [c[0] for c in candidates if c[1]]
+        if mobiles:
+            return mobiles[0]
+        return None  # leave blank if no personal number found
 
     def _resolve_owner_name(self):
+        """Cross-reference all name findings and pick the best with explanation."""
         if not self.name_findings:
             return
 
+        # Sort by confidence (highest first)
         findings = sorted(self.name_findings, key=lambda f: f.confidence, reverse=True)
         best = findings[0]
-        cross_refs = [o for o in findings[1:] if _names_match(best.name, o.name)]
-        conflicts = [o for o in findings[1:] if o not in cross_refs and o.name]
 
+        # Check for cross-references
+        cross_refs = []
+        for other in findings[1:]:
+            if _names_match(best.name, other.name):
+                cross_refs.append(other)
+
+        # Check for conflicts
+        conflicts = []
+        for other in findings[1:]:
+            if other not in cross_refs and other.name:
+                conflicts.append(other)
+
+        # Build how_found explanation and calculate final confidence
         self.owner_name = best.name
         self.owner_title = best.title
 
@@ -258,6 +240,7 @@ class EnrichmentResult:
         if cross_refs:
             ref_sources = [cr.method.split(":")[0].strip() for cr in cross_refs]
             explanation += f". Confirmed by {', '.join(ref_sources)}"
+            # Boost confidence for cross-references
             boost = min(len(cross_refs) * 0.10, 0.20)
             self.confidence = min(best.confidence + boost, 0.99)
         else:
@@ -266,7 +249,8 @@ class EnrichmentResult:
         if conflicts:
             conflict_info = [f"'{c.name}' ({c.method.split(':')[0].strip()})"
                             for c in conflicts[:2]]
-            explanation += f". Note: different name(s) found: {', '.join(conflict_info)}"
+            explanation += f". Note: different name(s) found elsewhere: {', '.join(conflict_info)}"
+            # Reduce confidence slightly if there are conflicts
             if not cross_refs:
                 self.confidence = max(self.confidence - 0.10, 0.20)
 
@@ -275,30 +259,50 @@ class EnrichmentResult:
 
 
 def _names_match(name1: str, name2: str) -> bool:
+    """Check if two names likely refer to the same person."""
     if not name1 or not name2:
         return False
-    n1, n2 = name1.lower().strip(), name2.lower().strip()
-    if n1 == n2 or n1 in n2 or n2 in n1:
+
+    n1 = name1.lower().strip()
+    n2 = name2.lower().strip()
+
+    # Exact match
+    if n1 == n2:
         return True
-    parts1, parts2 = n1.split(), n2.split()
+
+    # One contains the other
+    if n1 in n2 or n2 in n1:
+        return True
+
+    # Split into parts and check surname match
+    parts1 = n1.split()
+    parts2 = n2.split()
+
+    # Same surname (last word)
     if parts1 and parts2 and parts1[-1] == parts2[-1]:
         return True
+
+    # First name matches (handle Dave/David, etc.)
     if parts1 and parts2:
+        f1, f2 = parts1[0], parts2[0]
+        # Common nickname mappings
         nicknames = {
             "dave": "david", "mike": "michael", "rob": "robert", "bob": "robert",
             "bill": "william", "will": "william", "jim": "james", "jimmy": "james",
-            "tom": "thomas", "tony": "anthony", "nick": "nicholas",
-            "chris": "christopher", "matt": "matthew", "dan": "daniel",
+            "tom": "thomas", "tommy": "thomas", "tony": "anthony", "nick": "nicholas",
+            "chris": "christopher", "matt": "matthew", "dan": "daniel", "danny": "daniel",
             "steve": "steven", "sam": "samuel", "ben": "benjamin", "joe": "joseph",
             "alex": "alexander", "andy": "andrew", "pat": "patrick", "rick": "richard",
-            "ted": "edward", "ed": "edward", "charlie": "charles",
-            "harry": "harold", "jack": "john", "liz": "elizabeth",
-            "kate": "katherine", "jenny": "jennifer", "sue": "susan",
+            "dick": "richard", "ted": "edward", "ed": "edward", "charlie": "charles",
+            "harry": "harold", "jack": "john", "liz": "elizabeth", "beth": "elizabeth",
+            "kate": "katherine", "katie": "katherine", "jenny": "jennifer",
+            "sue": "susan", "meg": "margaret", "maggie": "margaret",
         }
-        f1 = nicknames.get(parts1[0], parts1[0])
-        f2 = nicknames.get(parts2[0], parts2[0])
-        if f1 == f2 and parts1[-1] == parts2[-1]:
+        f1_full = nicknames.get(f1, f1)
+        f2_full = nicknames.get(f2, f2)
+        if f1_full == f2_full and parts1[-1] == parts2[-1]:
             return True
+
     return False
 
 
@@ -307,40 +311,70 @@ def _names_match(name1: str, name2: str) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def extract_name_from_business(company_name: str) -> Optional[Tuple[str, str]]:
+    """
+    Try to extract an owner name from the business name.
+    Returns (extracted_name_part, explanation) or None.
+
+    Examples:
+      "Dave's Plumbing"        → ("Dave", "first_name")
+      "Smith & Sons Roofing"   → ("Smith", "surname")
+      "John Smith Plumbing"    → ("John Smith", "full_name")
+      "Mitchell's Kitchens"    → ("Mitchell", "surname")
+      "J Smith Electrical"     → ("Smith", "surname")
+    """
     if not company_name:
         return None
+
     name = company_name.strip()
 
-    poss = re.match(r"^([A-Z][a-z]+)(?:'s|'s)\s+", name)
-    if poss:
-        found = poss.group(1)
+    # Pattern 1: "Dave's Plumbing" or "Johnson's Carpets" (possessive)
+    poss_match = re.match(
+        r"^([A-Z][a-z]+)(?:'s|'s)\s+", name
+    )
+    if poss_match:
+        found = poss_match.group(1)
+        # Check it's not a place name
         if found.lower() not in LOCATION_WORDS and found.lower() not in TRADE_WORDS:
             return (found, "possessive_name")
 
-    full = re.match(r"^([A-Z][a-z]+)\s+([A-Z][a-z]+)\s+", name)
-    if full:
-        first, second = full.group(1), full.group(2)
+    # Pattern 2: "[FirstName] [LastName] [Trade]" — e.g. "John Smith Plumbing"
+    full_name_match = re.match(
+        r"^([A-Z][a-z]+)\s+([A-Z][a-z]+)\s+", name
+    )
+    if full_name_match:
+        first, second = full_name_match.group(1), full_name_match.group(2)
         if (first.lower() not in TRADE_WORDS and first.lower() not in LOCATION_WORDS
                 and second.lower() not in TRADE_WORDS and second.lower() not in LOCATION_WORDS):
             return (f"{first} {second}", "full_name")
 
-    sons = re.match(r"^([A-Z][a-z]+)\s*&\s*(?:Sons?|Brothers?|Partners?|Family|Co)\b", name)
-    if sons:
-        found = sons.group(1)
+    # Pattern 3: "[Surname] & Sons/Brothers/Partners/Family"
+    and_sons_match = re.match(
+        r"^([A-Z][a-z]+)\s*&\s*(?:Sons?|Brothers?|Partners?|Family|Daughters?|Co)\b",
+        name
+    )
+    if and_sons_match:
+        found = and_sons_match.group(1)
         if found.lower() not in LOCATION_WORDS and found.lower() not in TRADE_WORDS:
             return (found, "surname_and_family")
 
-    strade = re.match(r"^([A-Z][a-z]+)\s+(\w+)", name)
-    if strade:
-        pot, nxt = strade.group(1), strade.group(2)
-        if (nxt.lower() in TRADE_WORDS and pot.lower() not in LOCATION_WORDS
-                and pot.lower() not in TRADE_WORDS and len(pot) > 2):
-            return (pot, "surname_before_trade")
+    # Pattern 4: "[Surname] [Trade]" — e.g. "Smith Plumbing", "Mitchell Electrics"
+    surname_trade_match = re.match(r"^([A-Z][a-z]+)\s+(\w+)", name)
+    if surname_trade_match:
+        potential_surname = surname_trade_match.group(1)
+        next_word = surname_trade_match.group(2)
+        if (next_word.lower() in TRADE_WORDS
+                and potential_surname.lower() not in LOCATION_WORDS
+                and potential_surname.lower() not in TRADE_WORDS
+                and len(potential_surname) > 2):
+            return (potential_surname, "surname_before_trade")
 
-    init = re.match(r"^([A-Z])\s+([A-Z][a-z]+)\s+(\w+)", name)
-    if init:
-        surname, nxt = init.group(2), init.group(3)
-        if (nxt.lower() in TRADE_WORDS and surname.lower() not in LOCATION_WORDS
+    # Pattern 5: "[Initial] [Surname] [Trade]" — e.g. "J Smith Electrical"
+    initial_match = re.match(r"^([A-Z])\s+([A-Z][a-z]+)\s+(\w+)", name)
+    if initial_match:
+        surname = initial_match.group(2)
+        next_word = initial_match.group(3)
+        if (next_word.lower() in TRADE_WORDS
+                and surname.lower() not in LOCATION_WORDS
                 and surname.lower() not in TRADE_WORDS):
             return (surname, "initial_surname")
 
@@ -359,21 +393,10 @@ def get_domain(url: str) -> str:
     return urlparse(url).netloc or ""
 
 
-def is_real_business_url(url: str) -> bool:
-    """Check if URL is an actual business website, not a listing/social page."""
-    if not url:
-        return False
-    for pattern in SKIP_URL_PATTERNS:
-        if re.search(pattern, url, re.I):
-            return False
-    return True
-
-
 def safe_request(url: str, **kwargs) -> Optional[requests.Response]:
     try:
-        session = get_session()
-        resp = session.get(url, timeout=REQUEST_TIMEOUT,
-                           allow_redirects=True, **kwargs)
+        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT,
+                            allow_redirects=True, **kwargs)
         if resp.status_code == 200:
             return resp
     except Exception:
@@ -391,9 +414,12 @@ def extract_emails(text: str) -> list:
 
 def extract_phones(text: str) -> list:
     phones = PHONE_RE.findall(text)
-    return list(dict.fromkeys(
-        p.strip() for p in phones if 7 <= len(re.sub(r"\D", "", p)) <= 15
-    ))
+    cleaned = []
+    for p in phones:
+        digits = re.sub(r"\D", "", p)
+        if 7 <= len(digits) <= 15:
+            cleaned.append(p.strip())
+    return list(dict.fromkeys(cleaned))
 
 
 def get_field(row: dict, candidates: list) -> str:
@@ -411,39 +437,52 @@ def get_field(row: dict, candidates: list) -> str:
 
 
 def extract_postcode(address: str) -> str:
+    """Extract a UK postcode from an address string."""
     if not address:
         return ""
-    match = re.search(r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}", address.upper())
+    match = re.search(
+        r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}", address.upper()
+    )
     return match.group(0).strip() if match else ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Companies House (with caching + early stop on strong match)
+# Companies House (Aggressive UK Matching)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _generate_ch_names(company_name: str) -> list:
+def _generate_ch_search_names(company_name: str) -> list:
+    """Generate multiple name variations for Companies House search."""
     names = []
     name = company_name.strip()
+
+    # Original name
     names.append(name)
 
+    # Strip common suffixes that might not be in GMB data
     stripped = re.sub(r"\s*(Ltd\.?|Limited|LLP|PLC|Inc\.?)\s*$", "", name, flags=re.I).strip()
     if stripped != name:
         names.append(stripped)
 
+    # Add Ltd if not present
     if not re.search(r"(Ltd\.?|Limited|LLP|PLC)\s*$", name, re.I):
         names.append(f"{name} Ltd")
         names.append(f"{stripped} Limited")
 
+    # Swap & and 'and'
     if "&" in name:
         names.append(name.replace("&", "and"))
     if " and " in name.lower():
         names.append(re.sub(r"\band\b", "&", name, flags=re.I))
 
+    # Strip location words
     words = name.split()
-    core = [w for w in words if w.lower() not in LOCATION_WORDS and w.lower() != "the"]
-    if len(core) < len(words) and len(core) >= 2:
-        names.append(" ".join(core))
+    core_words = [w for w in words
+                  if w.lower() not in LOCATION_WORDS and w.lower() not in {"the"}]
+    if len(core_words) < len(words) and len(core_words) >= 2:
+        names.append(" ".join(core_words))
+        names.append(" ".join(core_words) + " Ltd")
 
+    # Deduplicate while preserving order
     seen = set()
     unique = []
     for n in names:
@@ -451,23 +490,23 @@ def _generate_ch_names(company_name: str) -> list:
         if nl and nl not in seen:
             seen.add(nl)
             unique.append(n)
-    return unique[:6]
+
+    return unique[:6]  # max 6 variations
 
 
 def enrich_companies_house(company_name: str, address: str,
-                           api_key: str) -> EnrichmentResult:
+                           api_key: str) -> Tuple[EnrichmentResult, Optional[NameFinding]]:
+    """Aggressively search Companies House with multiple name variations."""
     result = EnrichmentResult()
-    if not api_key or not company_name:
-        return result
+    finding = None
 
-    # Check cache
-    cache_key = company_name.lower().strip()
-    if cache_key in st.session_state.ch_cache:
-        return st.session_state.ch_cache[cache_key]
+    if not api_key or not company_name:
+        return result, finding
 
     gmb_postcode = extract_postcode(address)
-    search_names = _generate_ch_names(company_name)
+    search_names = _generate_ch_search_names(company_name)
 
+    best_officer = None
     best_company_number = ""
     best_match_score = 0
 
@@ -480,25 +519,33 @@ def enrich_companies_house(company_name: str, address: str,
         if not resp:
             continue
 
-        for item in resp.json().get("items", []):
+        items = resp.json().get("items", [])
+
+        for item in items:
             company_number = item.get("company_number", "")
             status = (item.get("company_status") or "").lower()
             ch_address = item.get("address_snippet", "")
             ch_title = item.get("title", "")
 
+            # Skip dissolved companies
             if status in ("dissolved", "liquidation", "administration"):
                 continue
 
+            # Score this match
             score = 0
+
+            # Name similarity
             if company_name.lower() in ch_title.lower() or ch_title.lower() in company_name.lower():
                 score += 3
             elif any(w in ch_title.lower() for w in company_name.lower().split() if len(w) > 3):
                 score += 1
 
+            # Postcode match (strong signal)
             ch_postcode = extract_postcode(ch_address)
             if gmb_postcode and ch_postcode and gmb_postcode.replace(" ", "") == ch_postcode.replace(" ", ""):
                 score += 5
 
+            # Active company bonus
             if status == "active":
                 score += 2
 
@@ -506,21 +553,19 @@ def enrich_companies_house(company_name: str, address: str,
                 best_match_score = score
                 best_company_number = company_number
 
-        # EARLY STOP: strong match found, skip remaining name variations
-        if best_match_score >= 5:
+        if best_match_score >= 5:  # good match found, stop searching variations
             break
 
     if not best_company_number:
-        st.session_state.ch_cache[cache_key] = result
-        return result
+        return result, finding
 
+    # Get officers for the best matching company
     resp2 = safe_request(
         f"https://api.company-information.service.gov.uk/company/{best_company_number}/officers",
         auth=(api_key, ""),
     )
     if not resp2:
-        st.session_state.ch_cache[cache_key] = result
-        return result
+        return result, finding
 
     for officer in resp2.json().get("items", []):
         role = (officer.get("officer_role") or "").lower()
@@ -535,9 +580,15 @@ def enrich_companies_house(company_name: str, address: str,
             else:
                 name = name.title()
 
-            conf = 0.92 if best_match_score >= 5 else 0.82 if best_match_score >= 3 else 0.70
+            # Determine confidence based on match quality
+            if best_match_score >= 5:
+                conf = 0.92
+            elif best_match_score >= 3:
+                conf = 0.82
+            else:
+                conf = 0.70
 
-            result.name_findings.append(NameFinding(
+            finding = NameFinding(
                 name=name,
                 title=role.replace("-", " ").title(),
                 source="companies_house",
@@ -546,135 +597,147 @@ def enrich_companies_house(company_name: str, address: str,
                         f"{', postcode match' if best_match_score >= 5 else ''})"),
                 confidence=conf,
                 company_number=best_company_number,
-            ))
+            )
+
+            result.name_findings.append(finding)
             break
 
-    st.session_state.ch_cache[cache_key] = result
-    return result
+    return result, finding
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Website Scraper (smart: 3 priority pages first, rest only if needed)
+# Website Scraper
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _scrape_page(base_url: str, path: str, result: EnrichmentResult,
-                 company_name: str) -> Optional[NameFinding]:
-    """Scrape a single page and extract data. Returns a NameFinding if owner found."""
-    url = base_url + path
-    resp = safe_request(url)
-    if not resp:
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    text = soup.get_text(separator=" ", strip=True)
-
-    result.emails_found.extend(extract_emails(text))
-    result.phones_found.extend(extract_phones(text))
-
+def enrich_website(website: str, company_name: str) -> Tuple[EnrichmentResult, Optional[NameFinding]]:
+    result = EnrichmentResult()
     finding = None
 
-    # Schema.org JSON-LD
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                for key in ("founder", "author", "employee", "member"):
-                    person = item.get(key)
-                    persons = [person] if isinstance(person, dict) else (person if isinstance(person, list) else [])
-                    for p in persons:
-                        if isinstance(p, dict) and p.get("name") and not finding:
-                            finding = NameFinding(
-                                name=p["name"], title=key.title(), source="website",
-                                method=f"Website {path}: schema.org '{key}' field",
-                                confidence=0.70,
-                            )
-                            result.name_findings.append(finding)
-                            break
-                if item.get("email"):
-                    result.emails_found.append(item["email"])
-                if item.get("telephone"):
-                    result.phones_found.append(item["telephone"])
-        except (json.JSONDecodeError, TypeError):
-            continue
-
-    # Owner text patterns
-    if not finding:
-        for tag in soup.find_all(["h1", "h2", "h3", "h4", "strong", "b", "p"]):
-            tag_text = tag.get_text(strip=True)
-            for pattern in OWNER_TITLE_PATTERNS:
-                if re.search(pattern, tag_text):
-                    for part in re.split(r"[—\-–|,]", tag_text):
-                        part = part.strip()
-                        if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}$", part):
-                            if not re.search(OWNER_TITLE_PATTERNS[0], part):
-                                title_match = re.search(pattern, tag_text)
-                                matched = title_match.group(0) if title_match else "Owner"
-                                finding = NameFinding(
-                                    name=part, title=matched, source="website",
-                                    method=f"Website {path}: name near '{matched}' text",
-                                    confidence=0.50,
-                                )
-                                result.name_findings.append(finding)
-                                return finding
-            if finding:
-                break
-
-    # Copyright footer
-    if not finding:
-        for cp in [r"(?:©|copyright)\s*(?:\d{4}\s*)?([A-Z][a-z]+\s+[A-Z][a-z]+)"]:
-            match = re.search(cp, text, re.I)
-            if match:
-                cname = match.group(1).strip()
-                if cname.lower() not in company_name.lower():
-                    finding = NameFinding(
-                        name=cname, title="Copyright holder", source="website",
-                        method=f"Website {path}: copyright notice",
-                        confidence=0.40,
-                    )
-                    result.name_findings.append(finding)
-                    break
-
-    # Meta author
-    if not finding:
-        author_meta = soup.find("meta", attrs={"name": "author"})
-        if author_meta and author_meta.get("content"):
-            aname = author_meta["content"].strip()
-            if len(aname.split()) >= 2:
-                finding = NameFinding(
-                    name=aname, title="Author", source="website",
-                    method=f"Website {path}: meta author tag",
-                    confidence=0.30,
-                )
-                result.name_findings.append(finding)
-
-    return finding
-
-
-def enrich_website(website: str, company_name: str) -> EnrichmentResult:
-    result = EnrichmentResult()
-    if not website or not is_real_business_url(website):
-        return result
+    if not website:
+        return result, finding
 
     base_url = website if website.startswith("http") else f"https://{website}"
     base_url = base_url.rstrip("/")
 
-    # Phase 1: Try priority pages
-    for path in PRIORITY_PATHS:
-        finding = _scrape_page(base_url, path, result, company_name)
-        if finding and result.emails_found:
-            return result  # got name + emails, done
+    for path in SCRAPE_PATHS:
+        if result.name_findings and result.emails_found:
+            break
 
-    # Phase 2: Only try secondary pages if we still need data
-    if not result.name_findings or not result.emails_found:
-        for path in SECONDARY_PATHS:
-            finding = _scrape_page(base_url, path, result, company_name)
-            if result.name_findings and result.emails_found:
-                break
+        url = base_url + path
+        resp = safe_request(url)
+        if not resp:
+            continue
 
-    return result
+        soup = BeautifulSoup(resp.text, "html.parser")
+        text = soup.get_text(separator=" ", strip=True)
+
+        result.emails_found.extend(extract_emails(text))
+        result.phones_found.extend(extract_phones(text))
+
+        # Schema.org JSON-LD
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("founder", "author", "employee", "member"):
+                        person = item.get(key)
+                        persons = []
+                        if isinstance(person, dict):
+                            persons = [person]
+                        elif isinstance(person, list):
+                            persons = person
+
+                        for p in persons:
+                            if isinstance(p, dict) and p.get("name") and not finding:
+                                f = NameFinding(
+                                    name=p["name"],
+                                    title=key.title(),
+                                    source="website",
+                                    method=f"Website {path}: schema.org '{key}' field",
+                                    confidence=0.70,
+                                )
+                                result.name_findings.append(f)
+                                finding = f
+                                break
+
+                    if item.get("email"):
+                        result.emails_found.append(item["email"])
+                    if item.get("telephone"):
+                        result.phones_found.append(item["telephone"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # Owner text patterns in HTML tags
+        if not finding:
+            for tag in soup.find_all(["h1", "h2", "h3", "h4", "strong", "b", "p"]):
+                tag_text = tag.get_text(strip=True)
+                for pattern in OWNER_TITLE_PATTERNS:
+                    if re.search(pattern, tag_text):
+                        parts = re.split(r"[—\-–|,]", tag_text)
+                        for part in parts:
+                            part = part.strip()
+                            if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}$", part):
+                                if not re.search(OWNER_TITLE_PATTERNS[0], part):
+                                    title_match = re.search(pattern, tag_text)
+                                    matched_title = title_match.group(0) if title_match else "Owner"
+                                    f = NameFinding(
+                                        name=part,
+                                        title=matched_title,
+                                        source="website",
+                                        method=f"Website {path}: name near '{matched_title}' text",
+                                        confidence=0.50,
+                                    )
+                                    result.name_findings.append(f)
+                                    finding = f
+                                    break
+                    if finding:
+                        break
+                if finding:
+                    break
+
+        # Copyright footer pattern: "© 2024 John Smith" or "Copyright John Smith"
+        if not finding:
+            copyright_patterns = [
+                r"(?:©|copyright)\s*(?:\d{4}\s*)?([A-Z][a-z]+\s+[A-Z][a-z]+)",
+                r"(?:©|copyright)\s*(?:\d{4}\s*[-–]\s*\d{4}\s*)?([A-Z][a-z]+\s+[A-Z][a-z]+)",
+            ]
+            for cp in copyright_patterns:
+                match = re.search(cp, text, re.I)
+                if match:
+                    cname = match.group(1).strip()
+                    # Make sure it's not the company name itself
+                    if cname.lower() not in company_name.lower():
+                        f = NameFinding(
+                            name=cname,
+                            title="Copyright holder",
+                            source="website",
+                            method=f"Website {path}: copyright notice '© {cname}'",
+                            confidence=0.40,
+                        )
+                        result.name_findings.append(f)
+                        finding = f
+                        break
+
+        # Meta author
+        if not finding:
+            author_meta = soup.find("meta", attrs={"name": "author"})
+            if author_meta and author_meta.get("content"):
+                aname = author_meta["content"].strip()
+                if len(aname.split()) >= 2:
+                    f = NameFinding(
+                        name=aname,
+                        title="Author",
+                        source="website",
+                        method=f"Website {path}: HTML meta author tag",
+                        confidence=0.30,
+                    )
+                    result.name_findings.append(f)
+                    finding = f
+
+    return result, finding
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -682,8 +745,6 @@ def enrich_website(website: str, company_name: str) -> EnrichmentResult:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _find_fb_on_website(website: str) -> Optional[str]:
-    if not website or not is_real_business_url(website):
-        return None
     base_url = website if website.startswith("http") else f"https://{website}"
     resp = safe_request(base_url)
     if not resp:
@@ -700,8 +761,9 @@ def _find_fb_on_website(website: str) -> Optional[str]:
 
 
 def enrich_facebook(website: str, company_name: str,
-                    facebook_url: str = "") -> EnrichmentResult:
+                    facebook_url: str = "") -> Tuple[EnrichmentResult, Optional[NameFinding]]:
     result = EnrichmentResult()
+    finding = None
 
     fb_url = None
     if facebook_url:
@@ -711,15 +773,14 @@ def enrich_facebook(website: str, company_name: str,
     if not fb_url and website:
         fb_url = _find_fb_on_website(website)
     if not fb_url:
-        return result
+        return result, finding
 
-    urls = [
+    urls_to_try = [
         fb_url.replace("www.facebook.com", "m.facebook.com"),
         (fb_url.rstrip("/") + "/about").replace("www.facebook.com", "m.facebook.com"),
     ]
 
-    finding = None
-    for url in urls:
+    for url in urls_to_try:
         if finding and result.emails_found:
             break
 
@@ -733,18 +794,20 @@ def enrich_facebook(website: str, company_name: str,
         result.emails_found.extend(extract_emails(text))
         result.phones_found.extend(extract_phones(text))
 
+        # OG tags
         for prop in ["og:description", "og:email", "og:phone_number"]:
             tag = soup.find("meta", property=prop)
             if tag and tag.get("content"):
-                c = tag["content"]
+                content = tag["content"]
                 if prop == "og:description":
-                    result.emails_found.extend(extract_emails(c))
-                    result.phones_found.extend(extract_phones(c))
+                    result.emails_found.extend(extract_emails(content))
+                    result.phones_found.extend(extract_phones(content))
                 elif prop == "og:email":
-                    result.emails_found.append(c)
+                    result.emails_found.append(content)
                 elif prop == "og:phone_number":
-                    result.phones_found.append(c)
+                    result.phones_found.append(content)
 
+        # Owner text patterns
         if not finding:
             owner_patterns = [
                 r"(?:owned|founded|managed|run|started|created)\s+by\s+"
@@ -753,33 +816,46 @@ def enrich_facebook(website: str, company_name: str,
                 r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})",
             ]
             for pattern in owner_patterns:
-                m = re.search(pattern, text)
-                if m:
-                    fname = m.group(1).strip()
+                match = re.search(pattern, text)
+                if match:
+                    fname = match.group(1).strip()
+                    words = fname.split()
                     bad = {"Facebook Page", "Our Team", "Our Company", "This Page",
                            "The Company", "More Info", "Read More", "Learn More"}
-                    if 2 <= len(fname.split()) <= 4 and fname not in bad:
-                        finding = NameFinding(
-                            name=fname, title="Owner", source="facebook",
-                            method=f"Facebook page: '{m.group(0)[:50].strip()}'",
+                    if 2 <= len(words) <= 4 and fname not in bad:
+                        f = NameFinding(
+                            name=fname,
+                            title="Owner",
+                            source="facebook",
+                            method=f"Facebook page: '{match.group(0)[:50].strip()}'",
                             confidence=0.50,
                         )
-                        result.name_findings.append(finding)
+                        result.name_findings.append(f)
+                        finding = f
                         break
 
+        # Script-embedded page owner
         if not finding:
             for script in soup.find_all("script"):
-                om = re.search(r'"page_owner(?:_name)?":\s*"([^"]+)"', script.string or "")
-                if om and len(om.group(1).split()) >= 2:
-                    finding = NameFinding(
-                        name=om.group(1), title="Page Owner", source="facebook",
-                        method="Facebook page: transparency data",
-                        confidence=0.65,
-                    )
-                    result.name_findings.append(finding)
-                    break
+                script_text = script.string or ""
+                owner_match = re.search(
+                    r'"page_owner(?:_name)?":\s*"([^"]+)"', script_text
+                )
+                if owner_match:
+                    fname = owner_match.group(1)
+                    if len(fname.split()) >= 2:
+                        f = NameFinding(
+                            name=fname,
+                            title="Page Owner",
+                            source="facebook",
+                            method="Facebook page: transparency data (admin name)",
+                            confidence=0.65,
+                        )
+                        result.name_findings.append(f)
+                        finding = f
+                        break
 
-    return result
+    return result, finding
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -787,21 +863,23 @@ def enrich_facebook(website: str, company_name: str,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def enrich_hunter(website: str, company_name: str,
-                  api_key: str) -> EnrichmentResult:
+                  api_key: str) -> Tuple[EnrichmentResult, Optional[NameFinding]]:
     result = EnrichmentResult()
-    if not api_key or not website or not is_real_business_url(website):
-        return result
+    finding = None
+
+    if not api_key or not website:
+        return result, finding
 
     domain = get_domain(website)
     if not domain:
-        return result
+        return result, finding
 
     resp = safe_request(
         "https://api.hunter.io/v2/domain-search",
         params={"domain": domain, "api_key": api_key, "limit": 10}
     )
     if not resp:
-        return result
+        return result, finding
 
     data = resp.json().get("data", {})
     for entry in data.get("emails", []):
@@ -812,38 +890,43 @@ def enrich_hunter(website: str, company_name: str,
         position = (entry.get("position") or "").lower()
         is_owner = any(kw in position for kw in
                        ["owner", "founder", "ceo", "director", "president", "principal"])
-        first, last = entry.get("first_name", ""), entry.get("last_name", "")
+        first = entry.get("first_name", "")
+        last = entry.get("last_name", "")
 
-        if is_owner and first and last:
-            result.name_findings.append(NameFinding(
+        if is_owner and first and last and not finding:
+            f = NameFinding(
                 name=f"{first} {last}",
                 title=entry.get("position", "Owner"),
                 source="hunter",
                 method=f"Hunter.io: listed as '{entry.get('position', 'Owner')}' on domain",
                 confidence=0.75,
-            ))
+            )
+            result.name_findings.append(f)
             result.owner_email = email
+            finding = f
 
-    return result
+    return result, finding
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # WHOIS
 # ──────────────────────────────────────────────────────────────────────────────
 
-def enrich_whois(website: str) -> EnrichmentResult:
+def enrich_whois(website: str) -> Tuple[EnrichmentResult, Optional[NameFinding]]:
     result = EnrichmentResult()
-    if not WHOIS_AVAILABLE or not website or not is_real_business_url(website):
-        return result
+    finding = None
+
+    if not WHOIS_AVAILABLE or not website:
+        return result, finding
 
     domain = get_domain(website)
     if not domain:
-        return result
+        return result, finding
 
     try:
         w = whois.whois(domain)
     except Exception:
-        return result
+        return result, finding
 
     registrant = getattr(w, "name", None) or getattr(w, "registrant_name", None)
     if registrant and isinstance(registrant, str):
@@ -851,11 +934,15 @@ def enrich_whois(website: str) -> EnrichmentResult:
                       "redacted", "data protected", "withheld"]
         if not any(kw in registrant.lower() for kw in privacy_kw):
             if len(registrant.split()) >= 2:
-                result.name_findings.append(NameFinding(
-                    name=registrant.title(), title="Domain Registrant", source="whois",
-                    method="WHOIS: domain registrant (may be web developer)",
+                f = NameFinding(
+                    name=registrant.title(),
+                    title="Domain Registrant",
+                    source="whois",
+                    method="WHOIS: domain registrant name (may be web developer)",
                     confidence=0.25,
-                ))
+                )
+                result.name_findings.append(f)
+                finding = f
 
     emails = getattr(w, "emails", None)
     if emails:
@@ -865,15 +952,15 @@ def enrich_whois(website: str) -> EnrichmentResult:
             if "abuse" not in e.lower() and "privacy" not in e.lower():
                 result.emails_found.append(e)
 
-    return result
+    return result, finding
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Orchestrator — PARALLEL source execution within each row
+# Main Orchestrator
 # ──────────────────────────────────────────────────────────────────────────────
 
 def enrich_single_row(row: dict, config: dict) -> EnrichmentResult:
-    """Run all sources IN PARALLEL, then cross-reference."""
+    """Run all sources with cross-referencing."""
     company = get_field(row, ["company", "business_name", "name",
                                "company_name", "business", "title"])
     website = get_field(row, ["website", "url", "site", "web",
@@ -882,75 +969,87 @@ def enrich_single_row(row: dict, config: dict) -> EnrichmentResult:
     facebook = get_field(row, ["facebook", "facebook_url", "fb",
                                 "fb_url", "facebook_page", "social_facebook"])
     biz_phone = get_field(row, ["phone", "telephone", "tel", "business_phone"])
-    biz_intl = get_field(row, ["intl_phone", "international_phone",
-                                "intl phone", "intl_tel"])
-    business_phones = [p for p in [biz_phone, biz_intl] if p]
+    biz_intl_phone = get_field(row, ["intl_phone", "international_phone",
+                                      "intl phone", "intl_tel"])
+
+    business_phones = [p for p in [biz_phone, biz_intl_phone] if p]
 
     combined = EnrichmentResult()
+
+    # 0. Extract potential name from business name (for cross-referencing later)
     biz_name_extract = extract_name_from_business(company)
 
-    # Build list of source tasks to run in parallel
-    tasks = {}
-
+    # 1. Companies House (highest priority for UK)
     ch_key = config.get("ch_key", "")
+    if config.get("enable_ch", False) and ch_key:
+        r, _ = enrich_companies_house(company, address, ch_key)
+        combined.emails_found.extend(r.emails_found)
+        combined.phones_found.extend(r.phones_found)
+        combined.name_findings.extend(r.name_findings)
+
+    # 2. Website scraping
+    if config.get("enable_website", True):
+        r, _ = enrich_website(website, company)
+        combined.emails_found.extend(r.emails_found)
+        combined.phones_found.extend(r.phones_found)
+        combined.name_findings.extend(r.name_findings)
+
+    # 3. Hunter.io
     hunter_key = config.get("hunter_key", "")
+    if config.get("enable_hunter", False) and hunter_key:
+        r, _ = enrich_hunter(website, company, hunter_key)
+        combined.emails_found.extend(r.emails_found)
+        combined.phones_found.extend(r.phones_found)
+        combined.name_findings.extend(r.name_findings)
+        if r.owner_email:
+            combined.owner_email = r.owner_email
 
-    with ThreadPoolExecutor(max_workers=5) as source_executor:
-        # Submit all enabled sources at once
-        if config.get("enable_ch", False) and ch_key:
-            tasks["ch"] = source_executor.submit(
-                enrich_companies_house, company, address, ch_key)
+    # 4. Facebook
+    if config.get("enable_facebook", True):
+        r, _ = enrich_facebook(website, company, facebook)
+        combined.emails_found.extend(r.emails_found)
+        combined.phones_found.extend(r.phones_found)
+        combined.name_findings.extend(r.name_findings)
 
-        if config.get("enable_website", True):
-            tasks["web"] = source_executor.submit(
-                enrich_website, website, company)
+    # 5. WHOIS (last resort)
+    if config.get("enable_whois", True):
+        r, _ = enrich_whois(website)
+        combined.emails_found.extend(r.emails_found)
+        combined.phones_found.extend(r.phones_found)
+        combined.name_findings.extend(r.name_findings)
 
-        if config.get("enable_hunter", False) and hunter_key:
-            tasks["hunter"] = source_executor.submit(
-                enrich_hunter, website, company, hunter_key)
-
-        if config.get("enable_facebook", True):
-            tasks["fb"] = source_executor.submit(
-                enrich_facebook, website, company, facebook)
-
-        if config.get("enable_whois", True):
-            tasks["whois"] = source_executor.submit(
-                enrich_whois, website)
-
-        # Collect results as they complete
-        for key, future in tasks.items():
-            try:
-                r = future.result(timeout=30)
-                combined.merge_source(r)
-            except Exception:
-                pass
-
-    # Business name cross-reference
+    # 6. Business name cross-reference
     if biz_name_extract:
         extracted, extract_type = biz_name_extract
-        matched = False
+        # Check if any finding matches the extracted name
         for f in combined.name_findings:
             if _names_match(f.name, extracted) or extracted.lower() in f.name.lower():
+                # Boost confidence — business name confirms the finding
                 f.confidence = min(f.confidence + 0.10, 0.99)
                 f.method += f" (confirmed: business name contains '{extracted}')"
-                matched = True
                 break
-        if not matched and not combined.name_findings:
-            explanation = {
-                "possessive_name": f"first name from business name ('{company}')",
-                "full_name": f"full name from business name ('{company}')",
-                "surname_and_family": f"surname from business name ('{company}')",
-                "surname_before_trade": f"likely surname from business name ('{company}')",
-                "initial_surname": f"likely surname from business name ('{company}')",
-            }
-            combined.name_findings.append(NameFinding(
-                name=extracted, title="Possible owner", source="business_name",
-                method=f"Business name analysis: {explanation.get(extract_type, extract_type)}",
-                confidence=0.25,
-            ))
+        else:
+            # No other source found, use business name as weak finding
+            if not combined.name_findings:
+                explanation = {
+                    "possessive_name": f"first name from business name ('{company}')",
+                    "full_name": f"full name from business name ('{company}')",
+                    "surname_and_family": f"surname from business name ('{company}')",
+                    "surname_before_trade": f"likely surname from business name ('{company}')",
+                    "initial_surname": f"likely surname from business name ('{company}')",
+                }
+                combined.name_findings.append(NameFinding(
+                    name=extracted,
+                    title="Possible owner",
+                    source="business_name",
+                    method=f"Business name analysis: {explanation.get(extract_type, extract_type)}",
+                    confidence=0.25,
+                ))
 
+    # Finalize with cross-referencing
     combined.finalize(business_phones=business_phones)
 
+    # If nothing found at all
     if not combined.owner_name and not combined.how_found:
         combined.how_found = (
             "Not found — company may be a sole trader (not at Companies House), "
@@ -962,7 +1061,7 @@ def enrich_single_row(row: dict, config: dict) -> EnrichmentResult:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Row-Level Parallel Worker
+# Parallel Worker
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _process_one_row(args):
@@ -971,7 +1070,7 @@ def _process_one_row(args):
         result = enrich_single_row(row, config)
     except Exception as e:
         result = EnrichmentResult()
-        result.how_found = f"Error: {str(e)[:100]}"
+        result.how_found = f"Error during enrichment: {str(e)[:100]}"
 
     company = get_field(row, ["company", "business_name", "name",
                                "company_name", "business", "title"])
@@ -989,13 +1088,14 @@ def _process_one_row(args):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# UI: Main Page
+# Main Content
 # ──────────────────────────────────────────────────────────────────────────────
 
 st.markdown('<p class="main-header">🔍 GMB Lead Enricher</p>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Upload your GMB data → get owner names, emails & personal numbers</p>',
             unsafe_allow_html=True)
 
+# ── Settings (on main page, always visible) ──
 with st.expander("⚙️ Settings — click to configure sources, API keys & performance", expanded=False):
     set_col1, set_col2, set_col3 = st.columns(3)
 
@@ -1012,6 +1112,7 @@ with st.expander("⚙️ Settings — click to configure sources, API keys & per
                                value=os.environ.get("COMPANIES_HOUSE_KEY", ""),
                                type="password")
         enable_ch = st.toggle("Enable Companies House", value=bool(ch_key)) if ch_key else False
+
         hunter_key = st.text_input("📧 Hunter.io Key",
                                    value=os.environ.get("HUNTER_API_KEY", ""),
                                    type="password")
@@ -1021,6 +1122,7 @@ with st.expander("⚙️ Settings — click to configure sources, API keys & per
         st.markdown("**Performance**")
         workers = st.slider("Parallel workers", 1, 15, 10,
                              help="10 = safe & fast, 15 = aggressive")
+
         st.markdown("**Active Sources**")
         sources = {
             "Companies House": bool(ch_key and enable_ch),
@@ -1028,7 +1130,7 @@ with st.expander("⚙️ Settings — click to configure sources, API keys & per
             "Facebook Pages": enable_facebook,
             "Hunter.io": bool(hunter_key and enable_hunter),
             "WHOIS": enable_whois and WHOIS_AVAILABLE,
-            "Business Name": True,
+            "Business Name Analysis": True,
         }
         for name, active in sources.items():
             st.markdown(f"{'🟢' if active else '🔴'} {name}")
@@ -1049,6 +1151,7 @@ if uploaded_file:
     st.markdown(f"### 📋 Preview — {len(df)} rows loaded")
     st.dataframe(df.head(10), use_container_width=True, height=300)
 
+    # Column detection
     detected = {}
     for label, candidates in [
         ("Company", ["company", "business_name", "name", "company_name", "business", "title"]),
@@ -1067,8 +1170,10 @@ if uploaded_file:
                 break
 
     if detected:
-        st.success(f"Auto-detected: {', '.join(f'**{k}** → `{v}`' for k, v in detected.items())}")
+        cols = ", ".join([f"**{k}** → `{v}`" for k, v in detected.items()])
+        st.success(f"Auto-detected columns: {cols}")
 
+    # Row range
     col1, col2 = st.columns(2)
     with col1:
         start_row = st.number_input("Start from row", 1, len(df), 1) - 1
@@ -1076,11 +1181,12 @@ if uploaded_file:
         end_row = st.number_input("End at row", 1, len(df), len(df))
 
     total_rows = end_row - start_row
-    est_minutes = (total_rows / workers) * 1.5 / 60  # much faster with parallel sources
-    st.info(f"**{total_rows} rows** × **{workers} workers** × "
-            f"**{sum(1 for v in sources.values() if v)} sources (parallel)**. "
-            f"Estimated: **~{max(est_minutes, 0.5):.1f} minutes**")
+    active_count = sum(1 for v in sources.values() if v)
+    est_minutes = (total_rows / workers) * 3.0 / 60
+    st.info(f"Will process **{total_rows} rows** with **{workers} workers** "
+            f"and **{active_count} sources**. Estimated: **~{est_minutes:.1f} minutes**")
 
+    # Session state for stop button and results persistence
     if "enrichment_running" not in st.session_state:
         st.session_state.enrichment_running = False
     if "stop_requested" not in st.session_state:
@@ -1090,12 +1196,13 @@ if uploaded_file:
     if "results_stats" not in st.session_state:
         st.session_state.results_stats = None
 
-    c_start, c_stop = st.columns(2)
-    with c_start:
+    # Buttons
+    col_start, col_stop = st.columns(2)
+    with col_start:
         start_clicked = st.button("🚀 Start Enrichment", type="primary",
                                    use_container_width=True,
                                    disabled=st.session_state.enrichment_running)
-    with c_stop:
+    with col_stop:
         stop_clicked = st.button("🛑 Stop Enrichment", type="secondary",
                                   use_container_width=True,
                                   disabled=not st.session_state.enrichment_running)
@@ -1123,14 +1230,21 @@ if uploaded_file:
         status_text = st.empty()
         log_container = st.container()
 
-        found_names = found_emails = found_phones = completed = 0
+        found_names = 0
+        found_emails = 0
+        found_phones = 0
         results_data = [None] * total_rows
+        completed = 0
         stopped_early = False
+
         start_time = time.time()
 
-        work_items = [(i, df.iloc[start_row + i].to_dict(), config)
-                      for i in range(total_rows)]
+        work_items = []
+        for i, idx in enumerate(range(start_row, end_row)):
+            row = df.iloc[idx].to_dict()
+            work_items.append((i, row, config))
 
+        # Process in batches for stop button support
         batch_size = workers
         for batch_start in range(0, len(work_items), batch_size):
             if st.session_state.stop_requested:
@@ -1152,17 +1266,22 @@ if uploaded_file:
                         result_row.update({
                             "owner_name": "", "owner_title": "",
                             "owner_email": "", "personal_phone": "",
-                            "all_emails_found": "", "confidence_score": "0.00",
-                            "how_found": "Error"
+                            "all_emails_found": "",
+                            "confidence_score": "0.00",
+                            "how_found": "Error during processing"
                         })
                         result = EnrichmentResult()
                         company = "Unknown"
 
                     results_data[i] = result_row
                     completed += 1
-                    if result.owner_name: found_names += 1
-                    if result.owner_email: found_emails += 1
-                    if result.personal_phone: found_phones += 1
+
+                    if result.owner_name:
+                        found_names += 1
+                    if result.owner_email:
+                        found_emails += 1
+                    if result.personal_phone:
+                        found_phones += 1
 
                     elapsed = time.time() - start_time
                     rate = completed / elapsed if elapsed > 0 else 0
@@ -1173,29 +1292,38 @@ if uploaded_file:
                         f'<p class="processing-text">'
                         f'Completed {completed}/{total_rows} '
                         f'({rate:.1f} rows/sec) — ~{remaining:.0f}s remaining</p>',
-                        unsafe_allow_html=True)
+                        unsafe_allow_html=True
+                    )
 
                     with log_container:
-                        items = []
-                        if result.owner_name: items.append(f"👤 {result.owner_name}")
-                        if result.owner_email: items.append(f"📧 {result.owner_email}")
-                        if result.personal_phone: items.append(f"📞 {result.personal_phone}")
-                        icon = "🟢" if result.confidence >= 0.70 else "🟡" if result.confidence >= 0.40 else "🔴" if result.confidence > 0 else "⚪"
-                        if items:
-                            st.markdown(f"{icon} **{company}** — {' | '.join(items)}")
+                        found_items = []
+                        if result.owner_name:
+                            found_items.append(f"👤 {result.owner_name}")
+                        if result.owner_email:
+                            found_items.append(f"📧 {result.owner_email}")
+                        if result.personal_phone:
+                            found_items.append(f"📞 {result.personal_phone}")
+
+                        conf = result.confidence
+                        icon = "🟢" if conf >= 0.70 else "🟡" if conf >= 0.40 else "🔴" if conf > 0 else "⚪"
+
+                        if found_items:
+                            st.markdown(f"{icon} **{company}** — {' | '.join(found_items)}")
                         else:
                             st.markdown(f"⚪ **{company}** — no owner data found")
 
+        # Done
         st.session_state.enrichment_running = False
         st.session_state.stop_requested = False
+
         total_time = time.time() - start_time
         status_text.empty()
         progress_bar.empty()
 
         if stopped_early:
-            st.warning(f"Stopped early after {completed} rows.")
+            st.warning(f"Enrichment stopped early after {completed} rows.")
 
-        # Save results to session state so they persist
+        # Save results to session state so they persist across reruns
         final_df = pd.DataFrame([r for r in results_data if r is not None])
         st.session_state.results_df = final_df
         st.session_state.results_stats = {
@@ -1206,7 +1334,7 @@ if uploaded_file:
             "total_time": total_time,
         }
 
-    # ── Display results (persists across reruns) ──
+    # ── Display results (persists across page reruns) ──
     if st.session_state.results_df is not None and not st.session_state.results_df.empty:
         stats = st.session_state.results_stats
         results_df = st.session_state.results_df
@@ -1237,14 +1365,15 @@ if uploaded_file:
         st.markdown("### 📥 Download")
         c1, c2 = st.columns(2)
         with c1:
-            buf = io.StringIO()
-            results_df.to_csv(buf, index=False)
-            st.download_button("⬇️ Download CSV", buf.getvalue(),
-                               "enriched_leads.csv", "text/csv", use_container_width=True)
+            csv_buf = io.StringIO()
+            results_df.to_csv(csv_buf, index=False)
+            st.download_button("⬇️ Download CSV", csv_buf.getvalue(),
+                               "enriched_leads.csv", "text/csv",
+                               use_container_width=True)
         with c2:
-            buf = io.BytesIO()
-            results_df.to_excel(buf, index=False, engine="openpyxl")
-            st.download_button("⬇️ Download Excel", buf.getvalue(),
+            xlsx_buf = io.BytesIO()
+            results_df.to_excel(xlsx_buf, index=False, engine="openpyxl")
+            st.download_button("⬇️ Download Excel", xlsx_buf.getvalue(),
                                "enriched_leads.xlsx",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
@@ -1254,13 +1383,13 @@ else:
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("""#### 🏛️ Companies House
-        Aggressive UK matching with postcode verification,
-        6 name variations, and result caching.""")
+        Aggressive UK company matching with address verification,
+        multiple name variations, and postcode cross-checking.""")
     with c2:
         st.markdown("""#### 🌐 Website + Facebook
-        Smart scraping: 3 priority pages first, secondary
-        only if needed. Skips non-business URLs.""")
+        Scrapes business websites and Facebook pages for owner names,
+        emails, and personal phone numbers.""")
     with c3:
-        st.markdown("""#### ⚡ Speed Optimized
-        All sources run in parallel per row. Connection pooling,
-        6s timeout, Companies House caching.""")
+        st.markdown("""#### 🔄 Cross-Referencing
+        Verifies owner names across multiple sources including
+        business name analysis. Confidence-scored results.""")
