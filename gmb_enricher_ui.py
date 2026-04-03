@@ -961,7 +961,7 @@ def enrich_whois(website: str) -> Tuple[EnrichmentResult, Optional[NameFinding]]
 # ──────────────────────────────────────────────────────────────────────────────
 
 def enrich_single_row(row: dict, config: dict) -> EnrichmentResult:
-    """Run all sources with cross-referencing."""
+    """Run all sources IN PARALLEL, then cross-reference."""
     company = get_field(row, ["company", "business_name", "name",
                                "company_name", "business", "title"])
     website = get_field(row, ["website", "url", "site", "web",
@@ -980,46 +980,45 @@ def enrich_single_row(row: dict, config: dict) -> EnrichmentResult:
     # 0. Extract potential name from business name (for cross-referencing later)
     biz_name_extract = extract_name_from_business(company)
 
-    # 1. Companies House (highest priority for UK)
+    # Run all enabled sources in parallel
     ch_key = config.get("ch_key", "")
-    if config.get("enable_ch", False) and ch_key:
-        r, _ = enrich_companies_house(company, address, ch_key)
-        combined.emails_found.extend(r.emails_found)
-        combined.phones_found.extend(r.phones_found)
-        combined.name_findings.extend(r.name_findings)
-
-    # 2. Website scraping
-    if config.get("enable_website", True):
-        r, _ = enrich_website(website, company)
-        combined.emails_found.extend(r.emails_found)
-        combined.phones_found.extend(r.phones_found)
-        combined.name_findings.extend(r.name_findings)
-
-    # 3. Hunter.io
     hunter_key = config.get("hunter_key", "")
-    if config.get("enable_hunter", False) and hunter_key:
-        r, _ = enrich_hunter(website, company, hunter_key)
-        combined.emails_found.extend(r.emails_found)
-        combined.phones_found.extend(r.phones_found)
-        combined.name_findings.extend(r.name_findings)
-        if r.owner_email:
-            combined.owner_email = r.owner_email
+    tasks = {}
 
-    # 4. Facebook
-    if config.get("enable_facebook", True):
-        r, _ = enrich_facebook(website, company, facebook)
-        combined.emails_found.extend(r.emails_found)
-        combined.phones_found.extend(r.phones_found)
-        combined.name_findings.extend(r.name_findings)
+    with ThreadPoolExecutor(max_workers=5) as source_executor:
+        if config.get("enable_ch", False) and ch_key:
+            tasks["ch"] = source_executor.submit(
+                enrich_companies_house, company, address, ch_key)
 
-    # 5. WHOIS (last resort)
-    if config.get("enable_whois", True):
-        r, _ = enrich_whois(website)
-        combined.emails_found.extend(r.emails_found)
-        combined.phones_found.extend(r.phones_found)
-        combined.name_findings.extend(r.name_findings)
+        if config.get("enable_website", True):
+            tasks["web"] = source_executor.submit(
+                enrich_website, website, company)
 
-    # 6. Business name cross-reference
+        if config.get("enable_hunter", False) and hunter_key:
+            tasks["hunter"] = source_executor.submit(
+                enrich_hunter, website, company, hunter_key)
+
+        if config.get("enable_facebook", True):
+            tasks["fb"] = source_executor.submit(
+                enrich_facebook, website, company, facebook)
+
+        if config.get("enable_whois", True):
+            tasks["whois"] = source_executor.submit(
+                enrich_whois, website)
+
+        # Collect results as they complete
+        for key, future in tasks.items():
+            try:
+                r, _ = future.result(timeout=30)
+                combined.emails_found.extend(r.emails_found)
+                combined.phones_found.extend(r.phones_found)
+                combined.name_findings.extend(r.name_findings)
+                if r.owner_email and not combined.owner_email:
+                    combined.owner_email = r.owner_email
+            except Exception:
+                pass
+
+    # Business name cross-reference
     if biz_name_extract:
         extracted, extract_type = biz_name_extract
         # Check if any finding matches the extracted name
