@@ -13,6 +13,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional, List, Tuple
 from urllib.parse import urlparse
 
@@ -1195,6 +1196,8 @@ if uploaded_file:
         st.session_state.results_df = None
     if "results_stats" not in st.session_state:
         st.session_state.results_stats = None
+    if "run_history" not in st.session_state:
+        st.session_state.run_history = []
 
     # Buttons
     col_start, col_stop = st.columns(2)
@@ -1334,6 +1337,24 @@ if uploaded_file:
             "total_time": total_time,
         }
 
+        # Save to run history (max 10)
+        history_entry = {
+            "timestamp": datetime.now().strftime("%H:%M — %d %b %Y"),
+            "filename": uploaded_file.name,
+            "rows": completed,
+            "found_names": found_names,
+            "found_emails": found_emails,
+            "found_phones": found_phones,
+            "hit_rate": int(found_names / completed * 100) if completed else 0,
+            "total_time": total_time,
+            "csv_data": final_df.to_csv(index=False),
+            "xlsx_data": None,  # generated on demand to save memory
+            "df": final_df,
+        }
+        st.session_state.run_history.insert(0, history_entry)  # newest first
+        if len(st.session_state.run_history) > 10:
+            st.session_state.run_history.pop()  # drop oldest
+
     # ── Display results (persists across page reruns) ──
     if st.session_state.results_df is not None and not st.session_state.results_df.empty:
         stats = st.session_state.results_stats
@@ -1377,6 +1398,58 @@ if uploaded_file:
                                "enriched_leads.xlsx",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
+
+    # ── Run History (persists across reruns within session) ──
+    if st.session_state.run_history:
+        st.markdown("---")
+        st.markdown(f"## 📜 Run History ({len(st.session_state.run_history)} of 10)")
+
+        for idx, entry in enumerate(st.session_state.run_history):
+            hit_pct = entry["hit_rate"]
+            hit_icon = "🟢" if hit_pct >= 70 else "🟡" if hit_pct >= 40 else "🔴"
+
+            with st.expander(
+                f"{hit_icon} **{entry['filename']}** — "
+                f"{entry['rows']} rows — {hit_pct}% hit rate — "
+                f"{entry['timestamp']}"
+            ):
+                # Stats row
+                hc1, hc2, hc3, hc4 = st.columns(4)
+                with hc1:
+                    st.metric("Names Found", f"{entry['found_names']} ({hit_pct}%)")
+                with hc2:
+                    st.metric("Emails Found", entry["found_emails"])
+                with hc3:
+                    st.metric("Personal Phones", entry["found_phones"])
+                with hc4:
+                    st.metric("Time", f"{entry['total_time']:.0f}s")
+
+                # Download buttons
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    st.download_button(
+                        "⬇️ Download CSV",
+                        entry["csv_data"],
+                        f"enriched_{entry['filename']}",
+                        "text/csv",
+                        use_container_width=True,
+                        key=f"hist_csv_{idx}",
+                    )
+                with dc2:
+                    hist_xlsx = io.BytesIO()
+                    entry["df"].to_excel(hist_xlsx, index=False, engine="openpyxl")
+                    st.download_button(
+                        "⬇️ Download Excel",
+                        hist_xlsx.getvalue(),
+                        f"enriched_{entry['filename'].rsplit('.', 1)[0]}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key=f"hist_xlsx_{idx}",
+                    )
+
+        if st.button("🗑️ Clear History", use_container_width=True):
+            st.session_state.run_history = []
+            st.rerun()
 
 else:
     st.markdown("---")
