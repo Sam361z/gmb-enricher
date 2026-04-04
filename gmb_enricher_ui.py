@@ -573,7 +573,7 @@ def enrich_companies_house(company_name: str, address: str,
         name = officer.get("name", "")
         resigned = officer.get("resigned_on")
 
-        if not resigned and role in ("director", "secretary", "llp-member",
+        if not resigned and role in ("director", "llp-member",
                                       "llp-designated-member", "managing-officer"):
             if "," in name:
                 parts = name.split(",", 1)
